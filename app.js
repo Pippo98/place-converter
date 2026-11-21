@@ -6,11 +6,17 @@
 const PLACE = {
   name: 'Place',
   code: 'PLC',
-  rateEur: 4.3343,       // 1 Place in EUR: the page opens at exactly this value
-  wobble: 0.00002,       // max distance (in EUR) the live rate drifts from rateEur.
-                         // Small enough that both 4.3343 and the inverse 0.23072 never change.
+  rateEur: 4.3343,       // 1 Place in EUR: the history is scaled so the page opens at exactly this value
+  liveMove: 0.00002,     // after page load the rate stays within ±this (EUR) of rateEur,
+                         // so both 4.3343 and the inverse 0.23072 never change on screen
+  growthPerYear: 0.8,    // steady uptrend: 0.8 = +80% a year against EUR (the up-jumps add more)
+  dailyVol: 0.008,       // typical daily move in the history (0.008 = 0.8%)
+  meanReversion: 0.06,   // how hard everyday noise is pulled back toward the trend each day (0..1)
+  eventChance: 0.03,     // chance, per day, of a big "Place event" (a sudden, lasting jump)
+  eventSize: 0.05,       // typical size of such an event (0.05 = 5%)
+  eventUpChance: 0.9,    // share of those events that are jumps up (0.5 = as many up as down)
   genesis: '2024-01-01', // first trading day of Place
-  seed: 'place',         // change it to get a different wobble
+  seed: 'place',         // change it to get a completely different (but stable) history
 };
 
 const DEFAULT_CURRENCY = 'EUR';
@@ -61,9 +67,13 @@ const currencyName = (code) => {
 };
 
 /* =====================================================================
- *  The Place price model: pinned at PLACE.rateEur, with a tiny wobble
- *  (never more than PLACE.wobble) so the chart stays alive while the
- *  displayed, rounded rate never changes. The wobble is zero at page load.
+ *  The Place price model: deterministic, so everyone sees the same rate.
+ *  Daily closes follow a mean-reverting random walk (with the occasional
+ *  "event") on top of a steady uptrend; within a day the price drifts
+ *  smoothly between closes.
+ *  The whole curve is scaled so that it reads exactly PLACE.rateEur at
+ *  page load. After that the same movements continue, but squeezed into
+ *  ±PLACE.liveMove, so the displayed (rounded) rate stays put.
  * ===================================================================== */
 function hashString(s) {
   let h = 2166136261;
@@ -79,31 +89,53 @@ function rand(n, stream) { // uniform in (0, 1), deterministic in (n, stream)
   h ^= h >>> 16;
   return ((h >>> 0) + 0.5) / 4294967296;
 }
-
-const GENESIS_DAY = Math.floor(Date.parse(PLACE.genesis + 'T00:00:00Z') / DAY);
-const LOADED_AT = Date.now();
-
-// Waves on several time scales so every chart range has some movement.
-// Weights (plus the noise weight) add up to 1, so |wobble| <= PLACE.wobble.
-const WAVES = [
-  { period: 37 * MINUTE, weight: 0.15 },
-  { period: 5.3 * HOUR,  weight: 0.20 },
-  { period: 2.7 * DAY,   weight: 0.20 },
-  { period: 19 * DAY,    weight: 0.20 },
-  { period: 113 * DAY,   weight: 0.15 },
-];
-const NOISE = 0.10;
-
-function wobble(t) {
-  const dt = t - LOADED_AT;
-  let s = 0;
-  for (const w of WAVES) s += w.weight * Math.sin((2 * Math.PI * dt) / w.period);
-  const tick = Math.floor(dt / TICK);
-  if (tick !== 0) s += NOISE * (2 * rand(tick, 0) - 1);
-  return PLACE.wobble * s;
+function gauss(n, stream) {
+  const u = rand(n, stream * 2 + 100);
+  const v = rand(n, stream * 2 + 101);
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
 }
 
-const placeEur = (t) => PLACE.rateEur + wobble(t);
+const GENESIS_DAY = Math.floor(Date.parse(PLACE.genesis + 'T00:00:00Z') / DAY);
+const closes = [0]; // log-price at 00:00 UTC of GENESIS_DAY + i, before the trend
+const TREND_PER_DAY = Math.log(1 + PLACE.growthPerYear) / 365.25;
+let noise = 0, jumps = 0; // daily noise fades back to the trend; event jumps are permanent
+
+function logAtMidnight(day) {
+  const i = day - GENESIS_DAY;
+  if (i <= 0) return 0;
+  while (closes.length <= i) {
+    const d = GENESIS_DAY + closes.length - 1;
+    noise = noise * (1 - PLACE.meanReversion) + PLACE.dailyVol * gauss(d, 0);
+    if (rand(d, 1) < PLACE.eventChance) {
+      jumps += (rand(d, 2) < PLACE.eventUpChance ? 1 : -1) * PLACE.eventSize * (0.5 + rand(d, 3));
+    }
+    closes.push(noise + jumps);
+  }
+  return closes[i];
+}
+
+function placeLog(t) {
+  const day = Math.floor(t / DAY);
+  if (day < GENESIS_DAY) return 0;
+  const f = (t - day * DAY) / DAY;
+  const a = logAtMidnight(day);
+  const b = logAtMidnight(day + 1);
+  const envelope = Math.sin(Math.PI * f); // 0 at midnight, so closes are exact
+  let wiggle = 0;
+  for (let k = 1; k <= 5; k++) wiggle += Math.sin(2 * Math.PI * (k * f + rand(day, 10 + k))) / k;
+  const jitter = gauss(Math.floor(t / TICK), 4);
+  const trend = TREND_PER_DAY * (t / DAY - GENESIS_DAY);
+  return trend + a + (b - a) * f + envelope * PLACE.dailyVol * (0.3 * wiggle + 0.05 * jitter);
+}
+
+const LOADED_AT = Date.now();
+const LOG_AT_LOAD = placeLog(LOADED_AT);
+
+function placeEur(t) {
+  const diff = placeLog(t) - LOG_AT_LOAD;
+  if (t <= LOADED_AT) return PLACE.rateEur * Math.exp(diff);
+  return PLACE.rateEur + PLACE.liveMove * Math.tanh(diff / PLACE.dailyVol);
+}
 
 /* =====================================================================
  *  Real exchange rates (ECB via Frankfurter), with an offline fallback

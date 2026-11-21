@@ -12,7 +12,7 @@ A single static page with no build step and no dependencies:
 ## How the rates work
 
 - **Real currencies:** European Central Bank reference rates from the free [Frankfurter](https://frankfurter.dev) API (no API key). If the API can't be reached, the page uses a built-in snapshot.
-- **Place:** pinned at **1 PLC = 4.3343 EUR**. The page opens at exactly that value, then the rate wobbles by at most ±0.00002 EUR, so the chart keeps moving but the displayed (rounded) rate never changes.
+- **Place:** a deterministic, seeded random walk on top of a strong uptrend, with the occasional (mostly upward) "Place event" jump. The whole history is scaled so the page opens at exactly **1 PLC = 4.3343 EUR**. After that the rate keeps moving, but only within ±0.00002 EUR, so the displayed (rounded) rate never changes while the page is open.
 
 ## Tweaking the joke
 
@@ -23,9 +23,15 @@ const PLACE = {
   name: 'Place',
   code: 'PLC',
   rateEur: 4.3343,       // 1 Place in EUR, shown on page load
-  wobble: 0.00002,       // max drift from rateEur (keeps the rounded rate fixed)
+  liveMove: 0.00002,     // max drift from rateEur after load (keeps the rounded rate fixed)
+  growthPerYear: 0.8,    // steady uptrend (+80% a year; the up-jumps add more)
+  dailyVol: 0.008,       // typical daily move in the history (0.8%)
+  meanReversion: 0.06,   // pull everyday noise back toward the trend
+  eventChance: 0.03,     // chance per day of a big, lasting "Place event" jump
+  eventSize: 0.05,       // size of such an event (5%)
+  eventUpChance: 0.9,    // share of events that are jumps up
   genesis: '2024-01-01', // first trading day
-  seed: 'place',         // change for a different wobble
+  seed: 'place',         // change for a completely different history
 };
 ```
 
