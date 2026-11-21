@@ -6,13 +6,11 @@
 const PLACE = {
   name: 'Place',
   code: 'PLC',
-  baseEur: 2.5,          // long-run "fair value" of 1 Place, in EUR
-  dailyVol: 0.018,       // typical daily move (0.018 = 1.8%)
-  meanReversion: 0.03,   // how hard the price is pulled back toward baseEur each day (0..1)
-  eventChance: 0.03,     // chance, per day, of a big "Place event" (a sudden jump)
-  eventSize: 0.08,       // typical size of such an event (0.08 = 8%)
+  rateEur: 4.3343,       // 1 Place in EUR: the page opens at exactly this value
+  wobble: 0.00002,       // max distance (in EUR) the live rate drifts from rateEur.
+                         // Small enough that both 4.3343 and the inverse 0.23072 never change.
   genesis: '2024-01-01', // first trading day of Place
-  seed: 'place',         // change it to get a completely different (but stable) history
+  seed: 'place',         // change it to get a different wobble
 };
 
 const DEFAULT_CURRENCY = 'EUR';
@@ -63,9 +61,9 @@ const currencyName = (code) => {
 };
 
 /* =====================================================================
- *  The Place price model: deterministic, so everyone sees the same rate.
- *  Daily closes follow a mean-reverting random walk (with the occasional
- *  "event"); within a day the price drifts smoothly between closes.
+ *  The Place price model: pinned at PLACE.rateEur, with a tiny wobble
+ *  (never more than PLACE.wobble) so the chart stays alive while the
+ *  displayed, rounded rate never changes. The wobble is zero at page load.
  * ===================================================================== */
 function hashString(s) {
   let h = 2166136261;
@@ -81,43 +79,31 @@ function rand(n, stream) { // uniform in (0, 1), deterministic in (n, stream)
   h ^= h >>> 16;
   return ((h >>> 0) + 0.5) / 4294967296;
 }
-function gauss(n, stream) {
-  const u = rand(n, stream * 2 + 100);
-  const v = rand(n, stream * 2 + 101);
-  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
-}
 
 const GENESIS_DAY = Math.floor(Date.parse(PLACE.genesis + 'T00:00:00Z') / DAY);
-const closes = [0]; // log-price at 00:00 UTC of GENESIS_DAY + i
+const LOADED_AT = Date.now();
 
-function logAtMidnight(day) {
-  const i = day - GENESIS_DAY;
-  if (i <= 0) return 0;
-  while (closes.length <= i) {
-    const d = GENESIS_DAY + closes.length - 1;
-    let next = closes[closes.length - 1] * (1 - PLACE.meanReversion) + PLACE.dailyVol * gauss(d, 0);
-    if (rand(d, 1) < PLACE.eventChance) {
-      next += (rand(d, 2) < 0.5 ? -1 : 1) * PLACE.eventSize * (0.5 + rand(d, 3));
-    }
-    closes.push(next);
-  }
-  return closes[i];
+// Waves on several time scales so every chart range has some movement.
+// Weights (plus the noise weight) add up to 1, so |wobble| <= PLACE.wobble.
+const WAVES = [
+  { period: 37 * MINUTE, weight: 0.15 },
+  { period: 5.3 * HOUR,  weight: 0.20 },
+  { period: 2.7 * DAY,   weight: 0.20 },
+  { period: 19 * DAY,    weight: 0.20 },
+  { period: 113 * DAY,   weight: 0.15 },
+];
+const NOISE = 0.10;
+
+function wobble(t) {
+  const dt = t - LOADED_AT;
+  let s = 0;
+  for (const w of WAVES) s += w.weight * Math.sin((2 * Math.PI * dt) / w.period);
+  const tick = Math.floor(dt / TICK);
+  if (tick !== 0) s += NOISE * (2 * rand(tick, 0) - 1);
+  return PLACE.wobble * s;
 }
 
-function placeLog(t) {
-  const day = Math.floor(t / DAY);
-  if (day < GENESIS_DAY) return 0;
-  const f = (t - day * DAY) / DAY;
-  const a = logAtMidnight(day);
-  const b = logAtMidnight(day + 1);
-  const envelope = Math.sin(Math.PI * f); // 0 at midnight, so closes are exact
-  let wiggle = 0;
-  for (let k = 1; k <= 5; k++) wiggle += Math.sin(2 * Math.PI * (k * f + rand(day, 10 + k))) / k;
-  const jitter = gauss(Math.floor(t / TICK), 4);
-  return a + (b - a) * f + envelope * PLACE.dailyVol * (0.3 * wiggle + 0.05 * jitter);
-}
-
-const placeEur = (t) => PLACE.baseEur * Math.exp(placeLog(t));
+const placeEur = (t) => PLACE.rateEur + wobble(t);
 
 /* =====================================================================
  *  Real exchange rates (ECB via Frankfurter), with an offline fallback
@@ -205,7 +191,9 @@ const pairRate = (t) => {
 /* =====================================================================
  *  Formatting & parsing
  * ===================================================================== */
-const fmtRate = (v) => v.toLocaleString(LOCALE, { minimumSignificantDigits: 6, maximumSignificantDigits: 6 });
+const RATE_DIGITS = 5; // 4.3343
+const roundRate = (v) => Number(v.toPrecision(RATE_DIGITS));
+const fmtRate = (v) => v.toLocaleString(LOCALE, { minimumSignificantDigits: RATE_DIGITS, maximumSignificantDigits: RATE_DIGITS });
 
 function fmtInput(v) {
   if (!Number.isFinite(v)) return '';
@@ -329,7 +317,7 @@ function updateHero(now) {
 
 /* ---------- converter ---------- */
 function updateConverter(now) {
-  const rate = pairRate(now);
+  const rate = roundRate(pairRate(now)); // same rate as shown, so amounts don't flicker
   if (state.lastEdited === 'a') {
     const v = parseAmount(els.amountA.value);
     els.amountB.value = Number.isFinite(v) ? fmtInput(v * rate) : '';
